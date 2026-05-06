@@ -20,7 +20,7 @@ Video2Text is a Windows desktop app that transcribes local video and audio files
 For development and build:
 
 - Windows 10/11 x64.
-- Python 3.10 or newer: <https://www.python.org/downloads/windows/>
+- Python 3.10 to 3.12 recommended for the build environment: <https://www.python.org/downloads/windows/>
 - Flet: <https://flet.dev/docs/getting-started/installation/>
 - faster-whisper: <https://github.com/SYSTRAN/faster-whisper>
 - PyInstaller: <https://pyinstaller.org/en/latest/usage.html>
@@ -47,14 +47,18 @@ For runtime:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python .\main.py
 ```
 
 ## Build the Executable
 
 ```powershell
-pyinstaller --noconfirm .\video2text.spec
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m PyInstaller --noconfirm .\video2text.spec
 ```
 
 Output:
@@ -104,6 +108,7 @@ Audio-only inputs produce the `.txt` transcript and do not create a separate `.w
 
 ## Troubleshooting
 
+- `ModuleNotFoundError: No module named 'flet'`: rebuild from the same virtual environment where dependencies are installed. Activate `.venv`, run `python -m pip install -r requirements.txt`, then run `python -m PyInstaller --noconfirm .\video2text.spec`. Do not use a global `pyinstaller` command from another Python installation.
 - `FFmpeg was not found`: bundle `vendor/ffmpeg/bin/ffmpeg.exe` or install FFmpeg and add it to `PATH`.
 - `Could not load the Whisper model`: check internet access for first-run downloads, available disk space, or bundled local model files.
 - CUDA errors: use CPU mode first, then verify NVIDIA driver, CUDA, and cuDNN installation.

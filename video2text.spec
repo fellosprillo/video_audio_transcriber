@@ -1,11 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import importlib.util
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_dir = Path.cwd()
+required_packages = ("flet", "faster_whisper")
+
+missing_packages = [
+    package
+    for package in required_packages
+    if importlib.util.find_spec(package) is None
+]
+if missing_packages:
+    raise SystemExit(
+        "Missing build dependencies: "
+        + ", ".join(missing_packages)
+        + "\nActivate the project virtual environment and run:\n"
+        + "  python -m pip install -r requirements.txt\n"
+        + "Then rebuild with:\n"
+        + "  python -m PyInstaller --noconfirm .\\video2text.spec"
+    )
 
 
 def add_optional_tree(datas, source_root: Path, destination_root: Path) -> None:
@@ -27,17 +44,11 @@ add_optional_tree(datas, project_dir / "vendor" / "ffmpeg", Path("vendor") / "ff
 add_optional_tree(datas, project_dir / "models", Path("models"))
 
 for package in ("flet", "faster_whisper", "ctranslate2", "av"):
-    try:
-        datas += collect_data_files(package)
-    except Exception:
-        pass
+    datas += collect_data_files(package)
 
 hiddenimports = []
 for package in ("flet", "faster_whisper", "ctranslate2", "av", "tokenizers", "huggingface_hub"):
-    try:
-        hiddenimports += collect_submodules(package)
-    except Exception:
-        pass
+    hiddenimports += collect_submodules(package)
 
 icon_file = project_dir / "images" / "logo.ico"
 icon = str(icon_file) if icon_file.exists() else None

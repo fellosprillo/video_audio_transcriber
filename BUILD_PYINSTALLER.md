@@ -4,13 +4,13 @@ Run these commands from the repository root, which is this `app` folder after yo
 
 ## 1. Create the build environment
 
-Use Python 3.10 or newer on Windows 10/11 x64.
+Use Python 3.10 to 3.12 on Windows 10/11 x64.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ## 2. Optional: bundle FFmpeg
@@ -36,7 +36,11 @@ If the folder is missing, faster-whisper downloads the selected model on first u
 ## 4. Build
 
 ```powershell
-pyinstaller --noconfirm .\video2text.spec
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m PyInstaller --noconfirm .\video2text.spec
 ```
 
 The executable package is created here:
@@ -65,5 +69,6 @@ Verify that:
 ## Notes
 
 - The executable includes Python and Python packages, so end users do not install Python manually.
+- If the built executable reports `ModuleNotFoundError: No module named 'flet'`, PyInstaller used a Python environment without the project dependencies. Rebuild with `python -m PyInstaller --noconfirm .\video2text.spec` after activating `.venv`; avoid a global `pyinstaller` command from another Python installation.
 - CUDA mode requires a compatible NVIDIA GPU, driver, CUDA runtime libraries, and cuDNN on the target machine.
 - If the app fails on a clean Windows PC with missing Microsoft runtime DLLs, include `vendor/redist/vc_redist.x64.exe` before building the installer.
