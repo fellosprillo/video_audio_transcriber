@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+installer_output/
+*.log
+.pytest_cache/
+
+# Optional large local assets used only when building private installers.
+models/*/
+vendor/ffmpeg/bin/
+vendor/redist/*.exe
