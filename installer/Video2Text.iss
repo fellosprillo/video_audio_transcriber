@@ -1,5 +1,5 @@
 #define MyAppName "Video2Text"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "Video2Text"
 #define MyAppExeName "Video2Text.exe"
 

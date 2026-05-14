@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import threading
+import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -15,15 +18,13 @@ from transcription import (
     MEDIA_EXTENSIONS,
     MODEL_OPTIONS,
     TranscriptionConfig,
-    TranscriptionError,
     find_ffmpeg,
     resource_path,
-    transcribe,
 )
 
 
 APP_NAME = "Video2Text"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 ASSETS_DIR = resource_path()
 WATCHDOG_TIMEOUT_OPTIONS = [
     ("Off", "off"),
@@ -66,6 +67,25 @@ def _default_output_dir() -> Path:
     return documents if documents.exists() else Path.home()
 
 
+def _write_runtime_log(message: str) -> None:
+    try:
+        log_file = Path.home() / "video2text_runtime.log"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+
+
+def _format_eta(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def main(page: ft.Page) -> None:
     page.title = APP_NAME
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -83,26 +103,23 @@ def main(page: ft.Page) -> None:
 
     running = {"value": False}
     job_state = {"id": 0, "completed": True}
+    progress_state = {"started_at": 0.0}
 
-    ui_dispatch_state = {"active": False}
+    ui_thread_id = threading.get_ident()
 
     def _run_on_ui_thread(action) -> None:
         """Execute UI mutations on the page thread when available."""
-        caller = getattr(page, "call_from_thread", None)
-        if callable(caller) and not ui_dispatch_state["active"]:
-            try:
-                def _wrapped_action() -> None:
-                    ui_dispatch_state["active"] = True
-                    try:
-                        action()
-                    finally:
-                        ui_dispatch_state["active"] = False
+        if threading.get_ident() == ui_thread_id:
+            action()
+            return
 
-                caller(_wrapped_action)
+        caller = getattr(page, "call_from_thread", None)
+        if callable(caller):
+            try:
+                caller(action)
                 return
             except Exception:
-                pass
-        action()
+                return
 
     input_path = ft.TextField(
         label="Input video or audio file",
@@ -155,6 +172,8 @@ def main(page: ft.Page) -> None:
     status_text = ft.Text("Ready", color="#344054", size=13)
     result_text = ft.Text("", selectable=True, color="#0f5132", size=13)
     progress_ring = ft.ProgressRing(width=20, height=20, stroke_width=3, visible=False)
+    progress_bar = ft.ProgressBar(width=360, value=0, visible=False, color="#2563eb", bgcolor="#dbeafe")
+    progress_label = ft.Text("0%", size=12, color="#344054", visible=False)
 
     file_picker_cls = getattr(ft, "FilePicker", None)
     if file_picker_cls is None:
@@ -189,6 +208,25 @@ def main(page: ft.Page) -> None:
 
         _run_on_ui_thread(_append)
 
+    def set_progress(fraction: float | None) -> None:
+        def _set() -> None:
+            if fraction is None:
+                progress_bar.value = None
+                progress_label.value = "Working..."
+            else:
+                clamped = min(1.0, max(0.0, float(fraction)))
+                progress_bar.value = clamped
+                pct = int(clamped * 100)
+                elapsed = max(0.0, time.monotonic() - progress_state["started_at"])
+                if 0 < clamped < 1 and elapsed > 0:
+                    remaining = elapsed * (1.0 - clamped) / clamped
+                    progress_label.value = f"{pct}% - ETA {_format_eta(remaining)}"
+                else:
+                    progress_label.value = f"{pct}%"
+            update_page()
+
+        _run_on_ui_thread(_set)
+
     def show_snack(message: str, is_error: bool = False) -> None:
         def _show() -> None:
             snack = ft.SnackBar(
@@ -208,6 +246,11 @@ def main(page: ft.Page) -> None:
         def _set() -> None:
             running["value"] = value
             progress_ring.visible = value
+            progress_bar.visible = value
+            progress_label.visible = value
+            if not value:
+                progress_bar.value = 0
+                progress_label.value = "0%"
             start_button.disabled = value
             choose_file_button.disabled = value
             choose_folder_button.disabled = value
@@ -290,6 +333,8 @@ def main(page: ft.Page) -> None:
 
         result_text.value = ""
         append_log("Starting transcription job...")
+        progress_state["started_at"] = time.monotonic()
+        set_progress(0.0)
         job_state["id"] += 1
         current_job_id = job_state["id"]
         job_state["completed"] = False
@@ -299,27 +344,81 @@ def main(page: ft.Page) -> None:
         start_watchdog(current_job_id, job_done_event, timeout_seconds)
 
         def worker() -> None:
+            _write_runtime_log(f"Job {current_job_id} started")
             try:
-                result = transcribe(config, progress=append_log)
+                worker_script = resource_path("transcription_worker.py")
+                if not worker_script.is_file():
+                    raise RuntimeError(f"Worker script not found: {worker_script}")
+
+                payload = {
+                    "input_file": str(config.input_file),
+                    "output_dir": str(config.output_dir),
+                    "language": config.language,
+                    "model_size": config.model_size,
+                    "device": config.device,
+                }
+                command = [sys.executable, str(worker_script), json.dumps(payload, ensure_ascii=True)]
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                success_payload = None
+                assert process.stdout is not None
+                for raw_line in process.stdout:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        append_log(line)
+                        continue
+
+                    event_type = event.get("type")
+                    if event_type == "progress":
+                        append_log(str(event.get("message", "")))
+                        set_progress(event.get("fraction"))
+                    elif event_type == "success":
+                        success_payload = event
+                    elif event_type == "error":
+                        raise RuntimeError(str(event.get("message", "Unknown worker error")))
+
+                stderr_text = ""
+                if process.stderr is not None:
+                    stderr_text = process.stderr.read().strip()
+                return_code = process.wait()
+                if return_code != 0:
+                    if stderr_text:
+                        raise RuntimeError(stderr_text)
+                    raise RuntimeError(f"Worker exited with code {return_code}")
+
+                if success_payload is None:
+                    raise RuntimeError("Worker completed without success payload.")
+
+                _write_runtime_log(f"Job {current_job_id} transcribe() completed")
+                transcript_path = success_payload.get("text_file", "")
+                language = success_payload.get("language", "unknown")
+                segments = success_payload.get("segment_count", 0)
+
                 def _set_success_result() -> None:
                     result_text.value = (
-                        f"Completed. Transcript: {result.text_file} | "
-                        f"Language: {result.language} | Segments: {result.segment_count}"
+                        f"Completed. Transcript: {transcript_path} | "
+                        f"Language: {language} | Segments: {segments}"
                     )
                     update_page()
 
                 _run_on_ui_thread(_set_success_result)
                 show_snack("Transcription completed.")
-            except TranscriptionError as exc:
-                append_log(f"Error: {exc}")
-                def _set_error_result() -> None:
-                    result_text.value = "The job failed. Check the activity log for details."
-                    update_page()
-
-                _run_on_ui_thread(_set_error_result)
-                show_snack(str(exc), is_error=True)
             except Exception as exc:
                 append_log(f"Unexpected error: {exc}")
+                _write_runtime_log(
+                    f"Job {current_job_id} unexpected error: {exc}\n{traceback.format_exc()}"
+                )
                 def _set_unexpected_result() -> None:
                     result_text.value = "Unexpected error. Check the activity log for details."
                     update_page()
@@ -327,10 +426,12 @@ def main(page: ft.Page) -> None:
                 _run_on_ui_thread(_set_unexpected_result)
                 show_snack("Unexpected error. Check the activity log for details.", is_error=True)
             finally:
+                _write_runtime_log(f"Job {current_job_id} entering finally")
                 job_done_event.set()
                 if job_state["id"] == current_job_id:
                     job_state["completed"] = True
                     set_running(False)
+                _write_runtime_log(f"Job {current_job_id} finally completed")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -471,7 +572,13 @@ def main(page: ft.Page) -> None:
                 ),
                 ft.Row(
                     spacing=12,
-                    controls=[start_button, progress_ring, ft.Text(ffmpeg_status, size=12, color="#667085")],
+                    controls=[
+                        start_button,
+                        progress_ring,
+                        progress_bar,
+                        progress_label,
+                        ft.Text(ffmpeg_status, size=12, color="#667085"),
+                    ],
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
             ],

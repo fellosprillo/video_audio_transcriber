@@ -29,7 +29,13 @@ LANGUAGE_OPTIONS = [
 MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
 DEVICE_OPTIONS = ["cpu", "cuda"]
 
-ProgressCallback = Callable[[str], None]
+@dataclass(frozen=True)
+class ProgressUpdate:
+    message: str
+    fraction: float | None = None
+
+
+ProgressCallback = Callable[[ProgressUpdate], None]
 
 
 class TranscriptionError(RuntimeError):
@@ -95,9 +101,9 @@ def resolve_model_reference(model_size: str) -> str:
     return model_size
 
 
-def _notify(progress: ProgressCallback | None, message: str) -> None:
+def _notify(progress: ProgressCallback | None, message: str, fraction: float | None = None) -> None:
     if progress:
-        progress(message)
+        progress(ProgressUpdate(message=message, fraction=fraction))
 
 
 def _compute_type_for(device: str) -> str:
@@ -120,7 +126,7 @@ def extract_audio(input_file: Path, audio_file: Path, progress: ProgressCallback
             "under vendor/ffmpeg/bin before building the app."
         )
 
-    _notify(progress, "Extracting mono 16 kHz WAV audio with FFmpeg...")
+    _notify(progress, "Extracting mono 16 kHz WAV audio with FFmpeg...", 0.05)
     command = [
         ffmpeg_path,
         "-y",
@@ -182,10 +188,10 @@ def transcribe(config: TranscriptionConfig, progress: ProgressCallback | None = 
         if not audio_file.exists() or input_file.stat().st_mtime > audio_file.stat().st_mtime:
             extract_audio(input_file, audio_file, progress)
         else:
-            _notify(progress, f"Using existing extracted audio: {audio_file.name}")
+            _notify(progress, f"Using existing extracted audio: {audio_file.name}", 0.1)
         audio_input = audio_file
     elif input_file.suffix.lower() not in AUDIO_EXTENSIONS:
-        _notify(progress, "Unknown file extension; trying to transcribe it as media.")
+        _notify(progress, "Unknown file extension; trying to transcribe it as media.", 0.1)
 
     try:
         from faster_whisper import WhisperModel
@@ -196,7 +202,7 @@ def transcribe(config: TranscriptionConfig, progress: ProgressCallback | None = 
 
     model_reference = resolve_model_reference(config.model_size)
     compute_type = _compute_type_for(config.device)
-    _notify(progress, f"Loading model '{config.model_size}' on {config.device} ({compute_type})...")
+    _notify(progress, f"Loading model '{config.model_size}' on {config.device} ({compute_type})...", 0.2)
 
     try:
         model = WhisperModel(model_reference, device=config.device, compute_type=compute_type)
@@ -204,23 +210,32 @@ def transcribe(config: TranscriptionConfig, progress: ProgressCallback | None = 
         raise TranscriptionError(f"Could not load the Whisper model: {exc}") from exc
 
     language = config.language or None
-    _notify(progress, "Transcribing audio...")
+    _notify(progress, "Transcribing audio...", 0.25)
 
     try:
         segments, info = model.transcribe(str(audio_input), language=language)
         detected_language = getattr(info, "language", language or "unknown") or "unknown"
+        duration_seconds = float(getattr(info, "duration", 0.0) or 0.0)
 
         segment_count = 0
         with text_file.open("w", encoding="utf-8") as output:
             for segment in segments:
                 output.write(f"[{segment.start:.2f}s - {segment.end:.2f}s] {segment.text.strip()}\n")
                 segment_count += 1
-                if segment_count % 10 == 0:
-                    _notify(progress, f"Processed {segment_count} segments...")
+                if duration_seconds > 0:
+                    transcribe_fraction = min(1.0, max(0.0, float(segment.end) / duration_seconds))
+                    total_fraction = 0.25 + (0.7 * transcribe_fraction)
+                    _notify(
+                        progress,
+                        f"Processed {segment_count} segments ({segment.end:.1f}s / {duration_seconds:.1f}s)...",
+                        total_fraction,
+                    )
+                elif segment_count % 10 == 0:
+                    _notify(progress, f"Processed {segment_count} segments...", None)
     except Exception as exc:
         raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
-    _notify(progress, f"Saved transcript: {text_file}")
+    _notify(progress, f"Saved transcript: {text_file}", 1.0)
     return TranscriptionResult(
         text_file=text_file,
         audio_file=audio_file,

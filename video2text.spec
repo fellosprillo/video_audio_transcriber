@@ -38,7 +38,10 @@ def add_optional_tree(datas, source_root: Path, destination_root: Path) -> None:
         datas.append((str(source), str(destination)))
 
 
-datas = [(str(project_dir / "images" / "logo.png"), "images")]
+datas = [
+    (str(project_dir / "images" / "logo.png"), "images"),
+    (str(project_dir / "transcription_worker.py"), "."),
+]
 
 add_optional_tree(datas, project_dir / "vendor" / "ffmpeg", Path("vendor") / "ffmpeg")
 add_optional_tree(datas, project_dir / "models", Path("models"))

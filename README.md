@@ -76,7 +76,7 @@ iscc .\installer\Video2Text.iss
 Output:
 
 ```text
-installer_output/Video2TextSetup-1.0.0.exe
+installer_output/Video2TextSetup-1.0.2.exe
 ```
 
 ## Making the Installer More Self-Contained
