@@ -17,9 +17,12 @@ from transcription import (
     LANGUAGE_OPTIONS,
     MEDIA_EXTENSIONS,
     MODEL_OPTIONS,
+    ProgressUpdate,
     TranscriptionConfig,
+    TranscriptionError,
     find_ffmpeg,
     resource_path,
+    transcribe,
 )
 
 
@@ -86,6 +89,48 @@ def _format_eta(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _emit_worker_event(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+def run_worker_mode(payload_json: str) -> int:
+    try:
+        data = json.loads(payload_json)
+        config = TranscriptionConfig(
+            input_file=Path(data["input_file"]),
+            output_dir=Path(data["output_dir"]),
+            language=data.get("language") or "en",
+            model_size=data.get("model_size") or "small",
+            device=data.get("device") or "cpu",
+        )
+    except Exception as exc:
+        _emit_worker_event({"type": "error", "message": f"Invalid config payload: {exc}"})
+        return 2
+
+    def on_progress(update: ProgressUpdate) -> None:
+        _emit_worker_event({"type": "progress", "message": update.message, "fraction": update.fraction})
+
+    try:
+        result = transcribe(config, progress=on_progress)
+        _emit_worker_event(
+            {
+                "type": "success",
+                "text_file": str(result.text_file),
+                "audio_file": str(result.audio_file) if result.audio_file else None,
+                "language": result.language,
+                "segment_count": result.segment_count,
+            }
+        )
+        return 0
+    except TranscriptionError as exc:
+        _emit_worker_event({"type": "error", "message": str(exc)})
+        return 1
+    except Exception as exc:
+        _emit_worker_event({"type": "error", "message": f"Unexpected worker error: {exc}"})
+        return 1
+
+
 def main(page: ft.Page) -> None:
     page.title = APP_NAME
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -119,7 +164,11 @@ def main(page: ft.Page) -> None:
                 caller(action)
                 return
             except Exception:
-                return
+                pass
+        try:
+            action()
+        except Exception:
+            pass
 
     input_path = ft.TextField(
         label="Input video or audio file",
@@ -346,10 +395,6 @@ def main(page: ft.Page) -> None:
         def worker() -> None:
             _write_runtime_log(f"Job {current_job_id} started")
             try:
-                worker_script = resource_path("transcription_worker.py")
-                if not worker_script.is_file():
-                    raise RuntimeError(f"Worker script not found: {worker_script}")
-
                 payload = {
                     "input_file": str(config.input_file),
                     "output_dir": str(config.output_dir),
@@ -357,11 +402,15 @@ def main(page: ft.Page) -> None:
                     "model_size": config.model_size,
                     "device": config.device,
                 }
-                command = [sys.executable, str(worker_script), json.dumps(payload, ensure_ascii=True)]
+                payload_json = json.dumps(payload, ensure_ascii=True)
+                if getattr(sys, "frozen", False):
+                    command = [sys.executable, "--worker", payload_json]
+                else:
+                    command = [sys.executable, str(Path(__file__).resolve()), "--worker", payload_json]
                 process = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -385,16 +434,13 @@ def main(page: ft.Page) -> None:
                         set_progress(event.get("fraction"))
                     elif event_type == "success":
                         success_payload = event
+                        set_progress(1.0)
+                        break
                     elif event_type == "error":
                         raise RuntimeError(str(event.get("message", "Unknown worker error")))
 
-                stderr_text = ""
-                if process.stderr is not None:
-                    stderr_text = process.stderr.read().strip()
                 return_code = process.wait()
-                if return_code != 0:
-                    if stderr_text:
-                        raise RuntimeError(stderr_text)
+                if success_payload is None and return_code != 0:
                     raise RuntimeError(f"Worker exited with code {return_code}")
 
                 if success_payload is None:
@@ -622,4 +668,6 @@ def main(page: ft.Page) -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
+        raise SystemExit(run_worker_mode(sys.argv[2]))
     ft.app(target=main, assets_dir=str(ASSETS_DIR))

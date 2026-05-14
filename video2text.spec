@@ -40,7 +40,6 @@ def add_optional_tree(datas, source_root: Path, destination_root: Path) -> None:
 
 datas = [
     (str(project_dir / "images" / "logo.png"), "images"),
-    (str(project_dir / "transcription_worker.py"), "."),
 ]
 
 add_optional_tree(datas, project_dir / "vendor" / "ffmpeg", Path("vendor") / "ffmpeg")

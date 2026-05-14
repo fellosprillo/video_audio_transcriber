@@ -230,8 +230,9 @@ def transcribe(config: TranscriptionConfig, progress: ProgressCallback | None = 
                         f"Processed {segment_count} segments ({segment.end:.1f}s / {duration_seconds:.1f}s)...",
                         total_fraction,
                     )
-                elif segment_count % 10 == 0:
-                    _notify(progress, f"Processed {segment_count} segments...", None)
+                else:
+                    fallback_fraction = min(0.95, 0.25 + (segment_count * 0.02))
+                    _notify(progress, f"Processed {segment_count} segments...", fallback_fraction)
     except Exception as exc:
         raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
