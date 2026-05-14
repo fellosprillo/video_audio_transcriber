@@ -11,3 +11,4 @@ installer_output/
 models/*/
 vendor/ffmpeg/bin/
 vendor/redist/*.exe
+issues/
