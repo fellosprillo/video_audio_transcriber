@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import json
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -35,6 +37,15 @@ WATCHDOG_TIMEOUT_OPTIONS = [
     ("2 hours", "7200"),
     ("4 hours", "14400"),
 ]
+NATIVE_CRASH_EXIT_CODE = 3221226505
+TRANSCRIPT_RECOVERY_TOLERANCE_SECONDS = 10.0
+TRANSCRIPT_END_RE = re.compile(r"^\[[0-9.]+s\s+-\s+([0-9.]+)s\]")
+
+
+class WorkerProcessError(RuntimeError):
+    def __init__(self, message: str, return_code: int | None = None) -> None:
+        super().__init__(message)
+        self.return_code = return_code
 
 
 def _icon(name: str) -> str:
@@ -87,6 +98,14 @@ def _format_eta(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _subprocess_startup_kwargs() -> dict[str, int]:
+    if sys.platform == "win32":
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if create_no_window:
+            return {"creationflags": create_no_window}
+    return {}
 
 
 def _emit_worker_event(payload: dict) -> None:
@@ -372,6 +391,104 @@ def main(page: ft.Page) -> None:
             device=device_dropdown.value or "cpu",
         )
 
+    def find_ffprobe() -> str | None:
+        ffmpeg_path = find_ffmpeg()
+        if ffmpeg_path:
+            candidate = Path(ffmpeg_path).with_name("ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+            if candidate.is_file():
+                return str(candidate)
+
+        for candidate in (
+            resource_path("vendor", "ffmpeg", "bin", "ffprobe.exe"),
+            resource_path("vendor", "ffmpeg", "ffprobe.exe"),
+            resource_path("bin", "ffprobe.exe"),
+            resource_path("ffprobe.exe"),
+        ):
+            if candidate.is_file():
+                return str(candidate)
+
+        return shutil.which("ffprobe")
+
+    def media_duration_seconds(input_file: Path) -> float | None:
+        ffprobe_path = find_ffprobe()
+        if not ffprobe_path:
+            return None
+
+        command = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(input_file),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                **_subprocess_startup_kwargs(),
+            )
+        except OSError:
+            return None
+
+        if completed.returncode != 0:
+            return None
+
+        try:
+            duration = float((completed.stdout or "").strip())
+        except ValueError:
+            return None
+
+        return duration if duration > 0 else None
+
+    def recovered_transcript_payload(config: TranscriptionConfig) -> dict | None:
+        transcript_path = config.output_dir.expanduser().resolve() / f"{config.input_file.stem}.txt"
+        if not transcript_path.is_file() or transcript_path.stat().st_size == 0:
+            return None
+
+        segment_count = 0
+        last_transcript_second: float | None = None
+        try:
+            with transcript_path.open("r", encoding="utf-8") as transcript:
+                for line in transcript:
+                    if not line.strip():
+                        continue
+                    segment_count += 1
+                    match = TRANSCRIPT_END_RE.match(line)
+                    if match:
+                        last_transcript_second = float(match.group(1))
+        except OSError:
+            return None
+
+        media_duration = media_duration_seconds(config.input_file)
+        if media_duration is None or last_transcript_second is None:
+            append_log("Could not verify transcript completeness after worker crash.")
+            return None
+
+        delta = abs(media_duration - last_transcript_second)
+        if delta > TRANSCRIPT_RECOVERY_TOLERANCE_SECONDS:
+            append_log(
+                f"Transcript incomplete after worker crash: "
+                f"{last_transcript_second:.1f}s / {media_duration:.1f}s."
+            )
+            return None
+
+        return {
+            "type": "success",
+            "text_file": str(transcript_path),
+            "audio_file": None,
+            "language": config.language or "unknown",
+            "segment_count": segment_count,
+            "recovered": True,
+            "media_duration": media_duration,
+            "transcript_end": last_transcript_second,
+        }
+
     def start_transcription(_: ft.ControlEvent) -> None:
         if running["value"]:
             return
@@ -402,64 +519,93 @@ def main(page: ft.Page) -> None:
                     "model_size": config.model_size,
                     "device": config.device,
                 }
-                payload_json = json.dumps(payload, ensure_ascii=True)
-                if getattr(sys, "frozen", False):
-                    command = [sys.executable, "--worker", payload_json]
-                else:
-                    command = [sys.executable, str(Path(__file__).resolve()), "--worker", payload_json]
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
 
-                success_payload = None
-                assert process.stdout is not None
-                for raw_line in process.stdout:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        append_log(line)
-                        continue
+                def run_worker_process(compute_type: str | None = None) -> dict:
+                    payload_json = json.dumps(payload, ensure_ascii=True)
+                    if getattr(sys, "frozen", False):
+                        command = [sys.executable, "--worker", payload_json]
+                    else:
+                        command = [sys.executable, str(Path(__file__).resolve()), "--worker", payload_json]
 
-                    event_type = event.get("type")
-                    if event_type == "progress":
-                        append_log(str(event.get("message", "")))
-                        set_progress(event.get("fraction"))
-                    elif event_type == "success":
-                        success_payload = event
-                        set_progress(1.0)
-                        break
-                    elif event_type == "error":
-                        raise RuntimeError(str(event.get("message", "Unknown worker error")))
+                    env = os.environ.copy()
+                    if compute_type:
+                        env["VIDEO2TEXT_COMPUTE_TYPE"] = compute_type
 
-                return_code = process.wait()
-                if success_payload is None and return_code != 0:
-                    raise RuntimeError(f"Worker exited with code {return_code}")
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        env=env,
+                    )
 
-                if success_payload is None:
-                    raise RuntimeError("Worker completed without success payload.")
+                    success_payload = None
+                    assert process.stdout is not None
+                    for raw_line in process.stdout:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            append_log(line)
+                            continue
+
+                        event_type = event.get("type")
+                        if event_type == "progress":
+                            append_log(str(event.get("message", "")))
+                            set_progress(event.get("fraction"))
+                        elif event_type == "success":
+                            success_payload = event
+                            set_progress(1.0)
+                            break
+                        elif event_type == "error":
+                            raise WorkerProcessError(str(event.get("message", "Unknown worker error")))
+
+                    return_code = process.wait()
+                    if success_payload is None and return_code != 0:
+                        if return_code == NATIVE_CRASH_EXIT_CODE:
+                            recovered_payload = recovered_transcript_payload(config)
+                            if recovered_payload is not None:
+                                append_log(
+                                    "Worker crashed after writing the transcript. "
+                                    "Recovered completed output from disk."
+                                )
+                                set_progress(1.0)
+                                return recovered_payload
+                        raise WorkerProcessError(
+                            f"Worker exited with code {return_code}",
+                            return_code=return_code,
+                        )
+
+                    if success_payload is None:
+                        raise WorkerProcessError("Worker completed without success payload.")
+
+                    return success_payload
+
+                success_payload = run_worker_process()
 
                 _write_runtime_log(f"Job {current_job_id} transcribe() completed")
                 transcript_path = success_payload.get("text_file", "")
                 language = success_payload.get("language", "unknown")
                 segments = success_payload.get("segment_count", 0)
+                recovered = bool(success_payload.get("recovered"))
 
                 def _set_success_result() -> None:
+                    prefix = "Completed" if not recovered else "Completed (recovered)"
                     result_text.value = (
-                        f"Completed. Transcript: {transcript_path} | "
+                        f"{prefix}. Transcript: {transcript_path} | "
                         f"Language: {language} | Segments: {segments}"
                     )
                     update_page()
 
                 _run_on_ui_thread(_set_success_result)
-                show_snack("Transcription completed.")
+                if recovered:
+                    show_snack("Transcription recovered from completed output.")
+                else:
+                    show_snack("Transcription completed.")
             except Exception as exc:
                 append_log(f"Unexpected error: {exc}")
                 _write_runtime_log(

@@ -107,7 +107,10 @@ def _notify(progress: ProgressCallback | None, message: str, fraction: float | N
 
 
 def _compute_type_for(device: str) -> str:
-    return "float16" if device == "cuda" else "float32"
+    override = os.environ.get("VIDEO2TEXT_COMPUTE_TYPE")
+    if override:
+        return override
+    return "float16" if device == "cuda" else "int8"
 
 
 def _subprocess_flags() -> dict[str, int]:
@@ -218,6 +221,8 @@ def transcribe(config: TranscriptionConfig, progress: ProgressCallback | None = 
         duration_seconds = float(getattr(info, "duration", 0.0) or 0.0)
 
         segment_count = 0
+        last_notified_fraction = 0.0
+        last_notified_at = 0.0
         with text_file.open("w", encoding="utf-8") as output:
             for segment in segments:
                 output.write(f"[{segment.start:.2f}s - {segment.end:.2f}s] {segment.text.strip()}\n")
@@ -225,14 +230,23 @@ def transcribe(config: TranscriptionConfig, progress: ProgressCallback | None = 
                 if duration_seconds > 0:
                     transcribe_fraction = min(1.0, max(0.0, float(segment.end) / duration_seconds))
                     total_fraction = 0.25 + (0.7 * transcribe_fraction)
-                    _notify(
-                        progress,
-                        f"Processed {segment_count} segments ({segment.end:.1f}s / {duration_seconds:.1f}s)...",
-                        total_fraction,
+                    should_notify = (
+                        total_fraction - last_notified_fraction >= 0.01
+                        or segment_count - last_notified_at >= 25
+                        or total_fraction >= 0.95
                     )
+                    if should_notify:
+                        last_notified_fraction = total_fraction
+                        last_notified_at = float(segment_count)
+                        _notify(
+                            progress,
+                            f"Processed {segment_count} segments ({segment.end:.1f}s / {duration_seconds:.1f}s)...",
+                            total_fraction,
+                        )
                 else:
                     fallback_fraction = min(0.95, 0.25 + (segment_count * 0.02))
-                    _notify(progress, f"Processed {segment_count} segments...", fallback_fraction)
+                    if segment_count == 1 or segment_count % 10 == 0:
+                        _notify(progress, f"Processed {segment_count} segments...", fallback_fraction)
     except Exception as exc:
         raise TranscriptionError(f"Transcription failed: {exc}") from exc
 
