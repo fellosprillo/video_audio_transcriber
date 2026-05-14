@@ -84,12 +84,21 @@ def main(page: ft.Page) -> None:
     running = {"value": False}
     job_state = {"id": 0, "completed": True}
 
+    ui_dispatch_state = {"active": False}
+
     def _run_on_ui_thread(action) -> None:
         """Execute UI mutations on the page thread when available."""
         caller = getattr(page, "call_from_thread", None)
-        if callable(caller) and threading.current_thread() is not threading.main_thread():
+        if callable(caller) and not ui_dispatch_state["active"]:
             try:
-                caller(action)
+                def _wrapped_action() -> None:
+                    ui_dispatch_state["active"] = True
+                    try:
+                        action()
+                    finally:
+                        ui_dispatch_state["active"] = False
+
+                caller(_wrapped_action)
                 return
             except Exception:
                 pass
@@ -323,11 +332,7 @@ def main(page: ft.Page) -> None:
                     job_state["completed"] = True
                     set_running(False)
 
-        runner = getattr(page, "run_thread", None)
-        if callable(runner):
-            runner(worker)
-        else:
-            threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
 
     async def choose_file(_: ft.ControlEvent) -> None:
         file_type_enum = getattr(ft, "FilePickerFileType", None)
